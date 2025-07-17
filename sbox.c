@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -22,27 +23,23 @@ struct Share {
   int newuser;
   int newuts;
   int sysvsem;
+  int network;
 };
 
-struct Limits {};
-
-struct Share share = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+struct Share share = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 struct Options {
   int delete_after;
-  int network_acces;
-  char *resource_file;
-  char *symlinks;
-  char *files;
+  char *config;
   char *chroot_path;
-  char *unshare_flags;
   char *exec;
+  char *limits;
 };
 
 struct Options opts;
 
 // UNCHROOT PROCESSES
-void copy_f_to_chroot(char *dirs[]) {
+void copy_f_to_chroot(char *dir) {
   pid_t pid = fork();
   if (pid == -1) {
     perror("fork failed.");
@@ -50,13 +47,16 @@ void copy_f_to_chroot(char *dirs[]) {
   }
 
   if (pid == 0) {
-    execvp(dirs[0], dirs);
+    execlp("cp", "cp", "--parents", "-r", dir, opts.chroot_path, NULL);
     perror("execvp is failed");
     _exit(1);
   } else {
     waitpid(pid, NULL, 0);
   }
 }
+
+char *mounted_paths[100];
+int mounted = 0;
 
 void clean_chroot(char *dirname) {
   pid_t pid = fork();
@@ -70,63 +70,13 @@ void clean_chroot(char *dirname) {
     perror("execlp is failed");
     _exit(1);
   } else {
-    waitpid(pid, NULL, 0);
-  }
-}
-
-void symlink_parser(char *file_path) {
-  FILE *file = fopen(file_path, "r");
-  char line[256];
-
-  if (file == NULL) {
-    perror("fopen failed in limits_parser");
-    return;
-  }
-  while (fgets(line, sizeof(line), file)) {
-    line[strcspn(line, "\n")] = '\0';
-    if (line[0] == '\0')
-      continue;
-    char link_path[128];
-    char target[128];
-    if (sscanf(line, "%127[^-]->%127s", link_path, target) == 2) {
-      if (symlink(link_path, target) == -1) {
-        perror("symlink is failed");
-        _exit(1);
+    for (int i = 0; i < mounted; i++) {
+      if (umount(mounted_paths[i]) == -1) {
+        perror("umount is failed");
       }
+      free(mounted_paths[i]);
     }
-  }
-  fclose(file);
-}
-
-char *dirs[256];
-
-void file_parser(char *file_path) {
-  FILE *file = fopen(file_path, "r");
-  char line[256];
-  dirs[0] = "cp";
-  dirs[1] = "--parents";
-  dirs[2] = "-r";
-
-  if (file == NULL) {
-    perror("fopen failed in limits_parser");
-    return;
-  }
-  int i = 3;
-  while (fgets(line, sizeof(line), file)) {
-    line[strcspn(line, "\n")] = '\0';
-    if (line[0] == '\0')
-      continue;
-    dirs[i++] = strdup(line);
-  }
-  dirs[i] = strdup(opts.chroot_path);
-  dirs[i + 1] = NULL;
-
-  fclose(file);
-}
-
-void free_dirs() {
-  for (int i = 3; dirs[i] != NULL && dirs[i] != opts.chroot_path; i++) {
-    free(dirs[i]);
+    waitpid(pid, NULL, 0);
   }
 }
 
@@ -180,7 +130,16 @@ void limit(const char *key, rlim_t soft, rlim_t hard) {
   }
 }
 
-void limits_parser(char *file_path) {
+typedef struct {
+  int files;
+  int symlinks;
+  int share;
+  int limits;
+  int mounts;
+} Config;
+
+Config conf = {0, 0, 0, 0, 0};
+void file_parser(char *file_path) {
   FILE *file = fopen(file_path, "r");
   char line[256];
 
@@ -193,7 +152,155 @@ void limits_parser(char *file_path) {
     if (line[0] == '\0') {
       continue;
     }
+    if (strcmp(line, "files:") == 0) {
+      conf = (Config){1, 0, 0, 0};
+      continue;
+    }
+    if (strcmp(line, "symlinks:") == 0) {
+      conf = (Config){0, 1, 0, 0, 0};
+      continue;
+    }
+    if (strcmp(line, "share:") == 0) {
+      conf = (Config){0, 0, 1, 0, 0};
+      continue;
+    }
 
+    if (strcmp(line, "mounts:") == 0) {
+      conf = (Config){0, 0, 0, 0, 1};
+      continue;
+    }
+
+    if (conf.files == 1) {
+      copy_f_to_chroot(line);
+    }
+
+    if (conf.mounts == 1) {
+      char source[128], target[128], fstype[64], options[256], data[256];
+      if (sscanf(line, "%127s %127s %63s %255s %255[^\n]", source, target,
+                 fstype, options, data) == 5) {
+        char *options_tokens = strtok(options, ",");
+        unsigned long mountopt = 0;
+        while (options_tokens != NULL) {
+          if (strcmp(options_tokens, "readonly") == 0) {
+            mountopt |= MS_RDONLY;
+          } else if (strcmp(options_tokens, "nosuid") == 0) {
+            mountopt |= MS_NOSUID;
+          } else if (strcmp(options_tokens, "nodev") == 0) {
+            mountopt |= MS_NODEV;
+          } else if (strcmp(options_tokens, "noexec") == 0) {
+            mountopt |= MS_NOEXEC;
+          } else if (strcmp(options_tokens, "synchronous") == 0) {
+            mountopt |= MS_SYNCHRONOUS;
+          } else if (strcmp(options_tokens, "remount") == 0) {
+            mountopt |= MS_REMOUNT;
+          } else if (strcmp(options_tokens, "mandlock") == 0) {
+            mountopt |= MS_MANDLOCK;
+          } else if (strcmp(options_tokens, "dirsync") == 0) {
+            mountopt |= MS_DIRSYNC;
+          } else if (strcmp(options_tokens, "noatime") == 0) {
+            mountopt |= MS_NOATIME;
+          } else if (strcmp(options_tokens, "nodiratime") == 0) {
+            mountopt |= MS_NODIRATIME;
+          } else if (strcmp(options_tokens, "bind") == 0) {
+            mountopt |= MS_BIND;
+          } else if (strcmp(options_tokens, "move") == 0) {
+            mountopt |= MS_MOVE;
+          } else if (strcmp(options_tokens, "rec") == 0 ||
+                     strcmp(options_tokens, "recursive") == 0) {
+            mountopt |= MS_REC;
+          } else if (strcmp(options_tokens, "silent") == 0) {
+            mountopt |= MS_SILENT;
+          } else if (strcmp(options_tokens, "posixacl") == 0) {
+            mountopt |= MS_POSIXACL;
+          } else if (strcmp(options_tokens, "unbindable") == 0) {
+            mountopt |= MS_UNBINDABLE;
+          } else if (strcmp(options_tokens, "private") == 0) {
+            mountopt |= MS_PRIVATE;
+          } else if (strcmp(options_tokens, "slave") == 0) {
+            mountopt |= MS_SLAVE;
+          } else if (strcmp(options_tokens, "shared") == 0) {
+            mountopt |= MS_SHARED;
+          } else if (strcmp(options_tokens, "relatime") == 0) {
+            mountopt |= MS_RELATIME;
+          } else if (strcmp(options_tokens, "iversion") == 0) {
+            mountopt |= MS_I_VERSION;
+          } else if (strcmp(options_tokens, "strictatime") == 0) {
+            mountopt |= MS_STRICTATIME;
+          } else {
+            fprintf(stderr, "Unknown mount flag: %s\n", options_tokens);
+          }
+          options_tokens = strtok(NULL, ",");
+        }
+        char path[256];
+        if (target[0] == '/') {
+          snprintf(path, sizeof(path), "%s%s", opts.chroot_path, target);
+        } else {
+          snprintf(path, sizeof(path), "%s/%s", opts.chroot_path, target);
+        }
+        mkdir(path, 0755);
+        if (mount(source, path, fstype, mountopt,
+                  strlen(data) > 0 ? data : NULL) == -1) {
+          perror("mount failed");
+        }
+        mounted_paths[mounted++] = strdup(path);
+      }
+    }
+
+    if (conf.symlinks == 1) {
+      char linkpath[128];
+      char target[128];
+      char target_path[256];
+      if (sscanf(line, "%127[^-]->%127s", linkpath, target) == 2) {
+        snprintf(target_path, sizeof(target_path), "%s/%s", opts.chroot_path,
+                 target);
+        if (symlink(linkpath, target_path) == -1) {
+          perror("symlink is failed");
+          _exit(1);
+        }
+      }
+    }
+
+    if (conf.share == 1) {
+      if (strcmp(line, "files") == 0)
+        share.files = 0;
+      if (strcmp(line, "fs") == 0)
+        share.fs = 0;
+      if (strcmp(line, "cgroup") == 0)
+        share.newcgroup = 0;
+      if (strcmp(line, "ipc") == 0)
+        share.newipc = 0;
+      if (strcmp(line, "ns") == 0)
+        share.newns = 0;
+      if (strcmp(line, "pid") == 0)
+        share.newpid = 0;
+      if (strcmp(line, "time") == 0)
+        share.newtime = 0;
+      if (strcmp(line, "user") == 0)
+        share.newuser = 0;
+      if (strcmp(line, "uts") == 0)
+        share.newuts = 0;
+      if (strcmp(line, "sysvsem") == 0)
+        share.sysvsem = 0;
+      if (strcmp(line, "network") == 0)
+        share.network = 0;
+    }
+  }
+  fclose(file);
+}
+
+void limits_parser(char *filepath) {
+  FILE *file = fopen(filepath, "r");
+  char line[256];
+
+  if (file == NULL) {
+    perror("fopen failed in limits_parser");
+    return;
+  }
+  while (fgets(line, sizeof(line), file)) {
+    line[strcspn(line, "\n")] = '\0';
+    if (line[0] == '\0') {
+      continue;
+    }
     char key[64];
     unsigned long long soft_ll, hard_ll;
     if (sscanf(line, "%63[^=]=%llu:%llu", key, &soft_ll, &hard_ll) == 3) {
@@ -203,19 +310,6 @@ void limits_parser(char *file_path) {
       _exit(1);
     }
   }
-  fclose(file);
-}
-
-char **arg_parser(char *arguments) {
-  static char *args[300];
-  char *token = strtok(arguments, ",");
-  int i = 0;
-  while (token != NULL) {
-    args[i++] = token;
-    token = strtok(NULL, ",");
-  }
-  args[i] = NULL;
-  return args;
 }
 
 void set_chroot() {
@@ -223,9 +317,7 @@ void set_chroot() {
     perror("mkdir is failed");
     return;
   }
-  file_parser(opts.files);
-  copy_f_to_chroot(dirs);
-  symlink_parser(opts.symlinks);
+  file_parser(opts.config);
 }
 
 void chrooting() {
@@ -239,7 +331,7 @@ void chrooting() {
     flags |= CLONE_NEWCGROUP;
   if (!share.newipc)
     flags |= CLONE_NEWIPC;
-  if (!opts.network_acces)
+  if (!share.network)
     flags |= CLONE_NEWNET;
   if (!share.newns)
     flags |= CLONE_NEWNS;
@@ -258,12 +350,12 @@ void chrooting() {
     perror("unshare is failed");
     _exit(1);
   }
-  // RLIMITS
-  if (strlen(opts.resource_file) > 0) {
-    char schroot_path[200];
 
+  char schroot_path[200];
+  // RLIMITS
+  if (strlen(opts.limits) > 0) {
     snprintf(schroot_path, sizeof(schroot_path), "%s/limits", opts.chroot_path);
-    FILE *file = fopen(opts.resource_file, "r");
+    FILE *file = fopen(opts.limits, "r");
     FILE *out = fopen(schroot_path, "w");
     char line[256];
 
@@ -290,83 +382,45 @@ void chrooting() {
   }
   chdir("/");
 
-  if (opts.resource_file > 0) {
+  if (strlen(opts.limits) > 0) {
     limits_parser("/limits");
   }
 
-  execlp(opts.exec, opts.exec, NULL);
-  perror("exevcp is failed");
-  _exit(1);
+  if (strlen(opts.exec) > 0) {
+    execlp(opts.exec, opts.exec, NULL);
+    perror("exevlp is failed");
+    _exit(1);
+  }
 }
 
 int main(int argc, char *argv[]) {
   opts.delete_after = 0;
-  opts.network_acces = 0;
-  opts.files = "";
-  opts.symlinks = "";
-  opts.resource_file = "";
-  opts.unshare_flags = "";
+  opts.limits = "";
   opts.chroot_path = "/tmp/sbox_chroot";
   opts.exec = "/usr/bin/bash";
   int opt;
-  while ((opt = getopt(argc, argv, "hcnf:s:m:u:r:e:")) != -1) {
+  while ((opt = getopt(argc, argv, "hdc:f:e:p:l:")) != -1) {
     switch (opt) {
     case 'h':
       // help message
       break;
     case 'c':
-      opts.delete_after = 1;
-      break;
-    case 'n':
-      opts.network_acces = 1;
-      break;
-    case 'f':
-      opts.files = optarg;
-      break;
-    case 's':
-      opts.symlinks = optarg;
-      break;
-    case 'm':
-      opts.chroot_path = optarg;
-      break;
-    case 'u':
-      opts.unshare_flags = optarg;
-      break;
-    case 'r':
-      opts.resource_file = optarg;
+      opts.config = optarg;
       break;
     case 'e':
       opts.exec = optarg;
       break;
+    case 'l':
+      opts.limits = optarg;
+      break;
+    case 'p':
+      opts.chroot_path = optarg;
+      break;
+    case 'd':
+      opts.delete_after = 1;
+      break;
     }
   }
-
-  char **arguments = arg_parser(opts.unshare_flags);
-  if (arguments != NULL) {
-    for (int i = 0; arguments[i] != NULL; i++) {
-      if (strcmp(arguments[i], "files") == 0)
-        share.files = 0;
-      if (strcmp(arguments[i], "fs") == 0)
-        share.fs = 0;
-      if (strcmp(arguments[i], "cgroup") == 0)
-        share.newcgroup = 0;
-      if (strcmp(arguments[i], "ipc") == 0)
-        share.newipc = 0;
-      if (strcmp(arguments[i], "ns") == 0)
-        share.newns = 0;
-      if (strcmp(arguments[i], "pid") == 0)
-        share.newpid = 0;
-      if (strcmp(arguments[i], "time") == 0)
-        share.newtime = 0;
-      if (strcmp(arguments[i], "user") == 0)
-        share.newuser = 0;
-      if (strcmp(arguments[i], "uts") == 0)
-        share.newuts = 0;
-      if (strcmp(arguments[i], "sysvsem") == 0)
-        share.sysvsem = 0;
-    }
-  }
-
   set_chroot();
   pid_t pid = fork();
 
@@ -384,6 +438,9 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  free_dirs();
+  if (opts.limits && strlen(opts.limits) > 0) {
+    free(opts.limits);
+  }
+
   return 0;
 }

@@ -1,0 +1,20 @@
+files:
+/usr/lib
+/usr/lib64
+/usr/bin
+/home/schou/.local/bin
+
+
+symlinks:
+usr/lib->lib
+usr/lib64->lib64
+usr/bin->bin
+usr/bin->sbin
+
+limits = ./limits.sbox
+
+mounts:
+proc  /proc proc  nosuid,nodev,noexec
+sysfs /sys  sysfs ro,nosuid,nodev,noexec
+/dev  /dev  bind  recursive
+tmpfs /tmp  tmpfs nosuid,nodev size=64M
