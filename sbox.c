@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <sched.h>
+#include <seccomp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,48 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+const char *help_message =
+    "Usage: sbox [options]\n"
+    "\n"
+    "Options:\n"
+    "  -h            Show this help message and exit\n"
+    "  -c <config>   Path to the sandbox configuration file\n"
+    "  -e <exec>     Executable to run inside the sandbox (default: "
+    "/usr/bin/bash)\n"
+    "  -l <limits>   Path to resource limits file\n"
+    "  -p <path>     Path to the chroot directory (default: /tmp/sbox_chroot)\n"
+    "  -d            Delete chroot directory after execution\n"
+    "\n"
+    "Configuration file syntax:\n"
+    "\n"
+    "  files = path1 path2 ...           # List of files or directories to "
+    "copy inside chroot\n"
+    "  symlinks = link1->target1 link2->target2 ...  # Symlink definitions\n"
+    "  unshare = user network pid ipc uts cgroup    # Namespaces to isolate "
+    "(any subset, max 6)\n"
+    "  mounts = type1:source1:target1:flags1 type2:source2:target2:flags2 ...\n"
+    "                                   # Mount commands with options\n"
+    "  perms = syscall1 syscall2 ...    # Allowed syscalls for seccomp (max 50 "
+    "syscalls)\n"
+    "\n"
+    "  limits = ./limits.sbox            # Optional: specify resource limits "
+    "file inside config\n"
+    "\n"
+    "Resource limits file syntax:\n"
+    "  key=soft_limit:hard_limit         # Define resource limits, e.g.,\n"
+    "    cpu=10:20                      # CPU time in seconds\n"
+    "    fsize=1000:2000                # Max file size in KB\n"
+    "    as=500000:600000               # Address space (memory) in KB\n"
+    "    rss=100000:150000              # Resident set size (memory) in KB\n"
+    "    nproc=10:20                   # Number of processes\n"
+    "    nofile=100:200                 # Number of open files\n"
+    "\n"
+    "Notes:\n"
+    "  - You can specify 'limits' file inside the main config file to manage "
+    "everything in one place.\n"
+    "  - Max 50 syscalls can be allowed in perms.\n"
+    "  - Max 6 namespaces can be unshared.\n";
 
 struct Share {
   int files;
@@ -38,6 +81,8 @@ struct Options {
 
 struct Options opts;
 
+scmp_filter_ctx ctx = NULL;
+
 // UNCHROOT PROCESSES
 void copy_f_to_chroot(char *dir) {
   pid_t pid = fork();
@@ -58,6 +103,15 @@ void copy_f_to_chroot(char *dir) {
 char *mounted_paths[100];
 int mounted = 0;
 
+void umount_paths() {
+  for (int i = 0; i < mounted; i++) {
+    if (umount(mounted_paths[i]) == -1) {
+      perror("umount is failed");
+    }
+    free(mounted_paths[i]);
+  }
+}
+
 void clean_chroot(char *dirname) {
   pid_t pid = fork();
   if (pid == -1) {
@@ -70,12 +124,6 @@ void clean_chroot(char *dirname) {
     perror("execlp is failed");
     _exit(1);
   } else {
-    for (int i = 0; i < mounted; i++) {
-      if (umount(mounted_paths[i]) == -1) {
-        perror("umount is failed");
-      }
-      free(mounted_paths[i]);
-    }
     waitpid(pid, NULL, 0);
   }
 }
@@ -133,9 +181,10 @@ void limit(const char *key, rlim_t soft, rlim_t hard) {
 typedef struct {
   int files;
   int symlinks;
-  int share;
+  int unshare;
   int limits;
   int mounts;
+  int perms;
 } Config;
 
 Config conf = {0, 0, 0, 0, 0};
@@ -153,25 +202,97 @@ void file_parser(char *file_path) {
       continue;
     }
     if (strcmp(line, "files:") == 0) {
-      conf = (Config){1, 0, 0, 0};
+      conf = (Config){1, 0, 0, 0, 0, 0};
       continue;
     }
     if (strcmp(line, "symlinks:") == 0) {
-      conf = (Config){0, 1, 0, 0, 0};
+      conf = (Config){0, 1, 0, 0, 0, 0};
       continue;
     }
-    if (strcmp(line, "share:") == 0) {
-      conf = (Config){0, 0, 1, 0, 0};
+    if (strcmp(line, "unshare:") == 0) {
+      conf = (Config){0, 0, 1, 0, 0, 0};
       continue;
     }
-
+    if (strcmp(line, "perms:") == 0) {
+      conf = (Config){0, 0, 0, 0, 0, 1};
+      continue;
+    }
     if (strcmp(line, "mounts:") == 0) {
-      conf = (Config){0, 0, 0, 0, 1};
+      conf = (Config){0, 0, 0, 0, 1, 0};
       continue;
     }
 
     if (conf.files == 1) {
       copy_f_to_chroot(line);
+    }
+
+    if (conf.perms == 1) {
+      if (ctx == NULL) {
+        ctx = seccomp_init(SCMP_ACT_KILL);
+        if (ctx == NULL) {
+          perror("seccomp is failed");
+          _exit(1);
+        }
+      }
+      int rc = -1;
+      char value[128];
+
+      if (sscanf(line, "%127s", value) == 2) {
+        if (strcmp(value, "read") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+        } else if (strcmp(value, "write") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+        } else if (strcmp(value, "exit") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
+        } else if (strcmp(value, "exit_group") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+        } else if (strcmp(value, "brk") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
+        } else if (strcmp(value, "mmap") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+        } else if (strcmp(value, "munmap") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+        } else if (strcmp(value, "rt_sigaction") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigaction), 0);
+        } else if (strcmp(value, "rt_sigprocmask") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigprocmask),
+                                0);
+        } else if (strcmp(value, "sigreturn") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sigreturn), 0);
+        } else if (strcmp(value, "openat") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(openat), 0);
+        } else if (strcmp(value, "close") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+        } else if (strcmp(value, "fstat") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
+        } else if (strcmp(value, "stat") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(stat), 0);
+        } else if (strcmp(value, "lstat") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(lstat), 0);
+        } else if (strcmp(value, "readlink") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(readlink), 0);
+        } else if (strcmp(value, "access") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(access), 0);
+        } else if (strcmp(value, "getpid") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpid), 0);
+        } else if (strcmp(value, "gettid") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettid), 0);
+        } else if (strcmp(value, "gettimeofday") == 0) {
+          rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettimeofday), 0);
+        } else if (strcmp(value, "clock_gettime") == 0) {
+          rc =
+              seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_gettime), 0);
+        } else {
+          fprintf(stderr, "Unknown syscall perm: %s\n", value);
+          seccomp_release(ctx);
+          _exit(1);
+        }
+        if (rc < 0) {
+          fprintf(stderr, "seccomp_rule_add failed for %s\n", value);
+          seccomp_release(ctx);
+          _exit(1);
+        }
+      }
     }
 
     if (conf.mounts == 1) {
@@ -238,8 +359,9 @@ void file_parser(char *file_path) {
           snprintf(path, sizeof(path), "%s/%s", opts.chroot_path, target);
         }
         mkdir(path, 0755);
-        if (mount(source, path, fstype, mountopt,
-                  strlen(data) > 0 ? data : NULL) == -1) {
+        if (mount(source, path, (strcmp(fstype, "bind") == 0) ? NULL : fstype,
+                  mountopt, (strcmp(data, "non") == 0) ? NULL : data) == -1) {
+          fprintf(stderr, "%s %s %s\n", source, path, fstype);
           perror("mount failed");
         }
         mounted_paths[mounted++] = strdup(path);
@@ -260,7 +382,7 @@ void file_parser(char *file_path) {
       }
     }
 
-    if (conf.share == 1) {
+    if (conf.unshare == 1) {
       if (strcmp(line, "files") == 0)
         share.files = 0;
       if (strcmp(line, "fs") == 0)
@@ -316,6 +438,9 @@ void set_chroot() {
   if (mkdir(opts.chroot_path, S_IRWXU | S_IRWXG | S_IRWXO) == -1) {
     perror("mkdir is failed");
     return;
+  }
+  if (share.network == 1) {
+    copy_f_to_chroot("/etc/resolv.conf");
   }
   file_parser(opts.config);
 }
@@ -386,6 +511,15 @@ void chrooting() {
     limits_parser("/limits");
   }
 
+  if (ctx != NULL) {
+    if (seccomp_load(ctx) < 0) {
+      perror("seccomp_load failed");
+      seccomp_release(ctx);
+      _exit(1);
+    }
+    seccomp_release(ctx);
+  }
+
   if (strlen(opts.exec) > 0) {
     execlp(opts.exec, opts.exec, NULL);
     perror("exevlp is failed");
@@ -402,8 +536,8 @@ int main(int argc, char *argv[]) {
   while ((opt = getopt(argc, argv, "hdc:f:e:p:l:")) != -1) {
     switch (opt) {
     case 'h':
-      // help message
-      break;
+      printf("%s", help_message);
+      return 1;
     case 'c':
       opts.config = optarg;
       break;
@@ -433,13 +567,10 @@ int main(int argc, char *argv[]) {
     chrooting();
   } else {
     waitpid(pid, NULL, 0);
+    umount_paths();
     if (opts.delete_after == 1) {
       clean_chroot(opts.chroot_path);
     }
-  }
-
-  if (opts.limits && strlen(opts.limits) > 0) {
-    free(opts.limits);
   }
 
   return 0;

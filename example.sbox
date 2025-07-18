@@ -4,17 +4,34 @@ files:
 /usr/bin
 /home/schou/.local/bin
 
-
 symlinks:
 usr/lib->lib
 usr/lib64->lib64
 usr/bin->bin
 usr/bin->sbin
 
+unshare:
+ns
+network
+
 limits = ./limits.sbox
 
 mounts:
-proc  /proc proc  nosuid,nodev,noexec
-sysfs /sys  sysfs ro,nosuid,nodev,noexec
-/dev  /dev  bind  recursive
+proc  /proc proc  nosuid,nodev,noexec non
+sysfs /sys  sysfs readonly,nosuid,nodev,noexec non
 tmpfs /tmp  tmpfs nosuid,nodev size=64M
+
+# perms:
+# write
+# read
+# exit
+# fork
+# execve
+# clone
+# ptrace
+# open
+# socket
+# kill
+# chroot
+# mount
+# umount
