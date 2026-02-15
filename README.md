@@ -35,4 +35,4 @@ Example are available in the project tree. (example.sbox, limits.sbox)
 This project is licensed under the **GPL-3.0 License**.
 
 # Author
-Created by **0l3d**
+Created by **oled**
