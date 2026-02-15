@@ -12,7 +12,7 @@
 
 ## Usage
 ```bash
-git clone https://github.com/0l3d/sbox.git
+git clone https://git.sr.ht/~oled/sbox
 cd sbox/
 make
 
