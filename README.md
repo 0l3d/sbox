@@ -18,17 +18,6 @@ make
 
 ./sbox -h
 ```
-
-## Config Syntax
-Sections (case sensitive):
-- files: — list of files/directories to copy into chroot
-- symlinks: — list of symlink definitions linkpath->target
-- unshare: — namespaces to unshare (files, fs, cgroup, ipc, ns, pid, time, user, uts, sysvsem, network)
-- mounts: — mount points with format:
-    source target fstype options data
-    (e.g. /proc proc proc ro,nosuid,nodev,noexec non)
-- perms: — list of allowed syscalls for seccomp filter
-
 Example are available in the project tree. (example.sbox, limits.sbox)
 
 ## License
