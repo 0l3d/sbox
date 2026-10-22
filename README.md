@@ -12,7 +12,7 @@
 
 ## Usage
 ```bash
-git clone https://git.sr.ht/~oled/sbox
+git clone https://github.com/0l3d/sbox
 cd sbox/
 make
 
@@ -24,4 +24,4 @@ Example are available in the project tree. (example.sbox, limits.sbox)
 This project is licensed under the **GPL-3.0 License**.
 
 # Author
-Created by **oled**
+Created by **0l3d**
